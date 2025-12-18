@@ -1,0 +1,185 @@
+#!/usr/bin/env -S node
+import { createServer, request } from "http";
+import { mkdtempSync, writeFileSync, existsSync, unlinkSync, rmdirSync, chmodSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { spawn } from "child_process";
+
+// Configuration
+const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
+let TEMP_DIR;
+let UNIX_SOCKET_PATH;
+let PODMAN_WRAPPER_PATH;
+
+// Create temporary directory
+function setupTempDir() {
+  TEMP_DIR = mkdtempSync(join(tmpdir(), "docker-proxy-"));
+  UNIX_SOCKET_PATH = join(TEMP_DIR, "docker.sock");
+  PODMAN_WRAPPER_PATH = join(TEMP_DIR, "wrangler-podman");
+}
+
+// Create podman wrapper script
+function createPodmanWrapper() {
+  const wrapperScript = `#!/bin/bash
+
+# Array to hold filtered arguments
+filtered_args=()
+
+# Process all arguments
+for arg in "$@"; do
+    if [ "$skip_next" = true ]; then
+        skip_next=false
+        continue
+    fi
+
+    # Check if argument is --provenance=value
+    if [[ "$arg" == --provenance=* ]]; then
+        # Skip
+        continue
+    else
+        # Keep this argument
+        filtered_args+=("$arg")
+    fi
+done
+
+# Execute the real podman with filtered arguments
+exec podman "\${filtered_args[@]}"
+`;
+
+  writeFileSync(PODMAN_WRAPPER_PATH, wrapperScript, { mode: 0o755 });
+}
+
+// JSON.stringify replacer to filter out MemorySwappiness
+function memorySwappinessReplacer(key, value) {
+  if (key === "MemorySwappiness") {
+    return undefined;
+  }
+  return value;
+}
+
+// Create HTTP server listening on Unix socket
+function createProxyServer() {
+  const server = createServer((req, res) => {
+    // Collect request body
+    let requestBody = [];
+    req.on("data", (chunk) => {
+      requestBody.push(chunk);
+    });
+
+    req.on("end", () => {
+      requestBody = Buffer.concat(requestBody);
+
+      // Check if request is JSON and filter it
+      const contentType = req.headers["content-type"] || "";
+      if (contentType.includes("application/json") && requestBody.length > 0) {
+        try {
+          const jsonData = JSON.parse(requestBody.toString());
+          const filtered = JSON.stringify(jsonData, memorySwappinessReplacer);
+          requestBody = Buffer.from(filtered);
+
+          // Update content-length header
+          req.headers["content-length"] = requestBody.length;
+        } catch (err) {
+          console.error("Error parsing request JSON:", err.message);
+        }
+      }
+
+      // Create request to Docker socket
+      const options = {
+        socketPath: DOCKER_SOCKET_PATH,
+        method: req.method,
+        path: req.url,
+        headers: req.headers,
+      };
+
+      const proxyReq = request(options, (proxyRes) => {
+        // Pipe response directly back
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on("error", (err) => {
+        console.error("Proxy request error:", err.message);
+        res.writeHead(502);
+        res.end("Bad Gateway");
+      });
+
+      // Forward request body
+      if (requestBody.length > 0) {
+        proxyReq.write(requestBody);
+      }
+      proxyReq.end();
+    });
+  });
+
+  return server;
+}
+
+// Cleanup function
+function cleanup() {
+  if (PODMAN_WRAPPER_PATH && existsSync(PODMAN_WRAPPER_PATH)) {
+    unlinkSync(PODMAN_WRAPPER_PATH);
+  }
+  if (UNIX_SOCKET_PATH && existsSync(UNIX_SOCKET_PATH)) {
+    unlinkSync(UNIX_SOCKET_PATH);
+  }
+  if (TEMP_DIR && existsSync(TEMP_DIR)) {
+    rmdirSync(TEMP_DIR);
+  }
+}
+
+// Main execution
+function main() {
+  setupTempDir();
+  createPodmanWrapper();
+
+  const server = createProxyServer();
+
+  server.listen(UNIX_SOCKET_PATH, () => {
+    // Set socket permissions
+    chmodSync(UNIX_SOCKET_PATH, "666");
+
+    // Spawn wrangler with remaining args
+    const args = process.argv.slice(2);
+
+    const wrangler = spawn("pnpm", ["wrangler", ...args], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        WRANGLER_DOCKER_BIN: PODMAN_WRAPPER_PATH,
+        DOCKER_HOST: `unix://${UNIX_SOCKET_PATH}`,
+      },
+    });
+
+    wrangler.on("close", (code) => {
+      server.close(() => {
+        cleanup();
+        process.exit(code);
+      });
+    });
+
+    wrangler.on("error", (err) => {
+      console.error("Failed to spawn wrangler:", err.message);
+      server.close(() => {
+        cleanup();
+        process.exit(1);
+      });
+    });
+  });
+
+  process.on("SIGINT", () => {
+    server.close(() => {
+      cleanup();
+      process.exit(130);
+    });
+  });
+
+  process.on("SIGTERM", () => {
+    server.close(() => {
+      cleanup();
+      process.exit(143);
+    });
+  });
+}
+
+main();
